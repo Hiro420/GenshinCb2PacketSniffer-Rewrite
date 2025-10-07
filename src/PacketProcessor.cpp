@@ -10,10 +10,50 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <fstream>
 #include <unordered_map>
 #include <vector>
+#include <iomanip>
+#include <sstream>
+#include "ec2b_global.h"
 
 namespace fs = std::filesystem;
+
+static std::string to_hex(const uint8_t* data, size_t len, bool with_ascii = false) {
+    std::ostringstream oss;
+    oss.setf(std::ios::uppercase);
+    size_t bytes_per_line = 16;
+
+    for (size_t i = 0; i < len; ++i) {
+        if ((i % bytes_per_line) == 0) {
+            if (i) oss << "\n";
+        }
+        oss << std::setw(2) << std::setfill('0') << std::hex << (unsigned)data[i] << ' ';
+
+        if (with_ascii && ((i + 1) % bytes_per_line) == 0) {
+            oss << " |";
+            for (size_t j = i + 1 - bytes_per_line; j <= i; ++j) {
+                unsigned char c = data[j];
+                oss << (std::isprint(c) ? char(c) : '.');
+            }
+            oss << '|';
+        }
+    }
+
+    if (with_ascii && (len % bytes_per_line) != 0) {
+        size_t rem = len % bytes_per_line;
+        for (size_t k = rem; k < bytes_per_line; ++k) oss << "   ";
+        if (rem <= 8) oss << ' ';
+        oss << " |";
+        for (size_t j = len - rem; j < len; ++j) {
+            unsigned char c = data[j];
+            oss << (std::isprint(c) ? char(c) : '.');
+        }
+        oss << '|';
+    }
+
+    return oss.str();
+}
 
 static inline bool ReadVarint(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
     uint64_t v = 0; int shift = 0;
@@ -40,7 +80,7 @@ static inline uint32_t ReadBE32(const uint8_t* p) {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
 }
 
-static bool ExtractAccountUid(const uint8_t* payload, size_t payloadLen, std::string& accountUid) {
+static bool ExtractSecretKeySeed(const uint8_t* payload, size_t payloadLen, uint64_t& secretKeySeed) {
     const uint8_t* p = payload;
     const uint8_t* end = payload + payloadLen;
     while (p < end) {
@@ -48,17 +88,40 @@ static bool ExtractAccountUid(const uint8_t* payload, size_t payloadLen, std::st
         if (!ReadVarint(p, end, key)) return false;
         uint32_t fieldNumber = uint32_t(key >> 3);
         uint32_t wireType = uint32_t(key & 0x07);
+
         switch (wireType) {
-        case 0: { uint64_t dummy; if (!ReadVarint(p, end, dummy)) return false; break; }
-        case 1: { if (end - p < 8) return false; p += 8; break; }
-        case 2: {
-            size_t len = 0; if (!ReadLen(p, end, len)) return false;
-            if (end - p < ptrdiff_t(len)) return false;
-            if (fieldNumber == 2) { accountUid.assign(reinterpret_cast<const char*>(p), len); return true; }
-            p += len; break;
+        case 0: {
+            uint64_t val;
+            if (!ReadVarint(p, end, val)) return false;
+            if (fieldNumber == 11) {
+                secretKeySeed = val;
+                return true;
+            }
+            break;
         }
-        case 5: { if (end - p < 4) return false; p += 4; break; }
-        default: return false;
+        case 1: {
+            if (end - p < 8) return false;
+            if (fieldNumber == 11) {
+                secretKeySeed = *reinterpret_cast<const uint64_t*>(p);
+                return true;
+            }
+            p += 8;
+            break;
+        }
+        case 2: {
+            size_t len = 0;
+            if (!ReadLen(p, end, len)) return false;
+            if (end - p < ptrdiff_t(len)) return false;
+            p += len;
+            break;
+        }
+        case 5: {
+            if (end - p < 4) return false;
+            p += 4;
+            break;
+        }
+        default:
+            return false;
         }
     }
     return false;
@@ -652,6 +715,8 @@ static const std::unordered_map<uint16_t, const char*>& PacketNameMap() {
         { 2003, "GetActivityInfoReq" },
         { 2004, "GetActivityInfoRsp" },
         { 2005, "ActivityPlayOpenAnimNotify" },
+        { 2006, "ActivityInfoNotify" },
+        { 2007, "ActivityScheduleInfoNotify" },
         { 2014, "SeaLampFlyLampReq" },
         { 2015, "SeaLampFlyLampRsp" },
         { 2016, "SeaLampTakeContributionRewardReq" },
@@ -745,6 +810,9 @@ static const std::unordered_map<uint16_t, const char*>& PacketNameMap() {
         { 10011, "ReloadConfigNotify" },
         { 10102, "SavePlayerDataReq" },
         { 10103, "SavePlayerDataRsp" },
+        { 10104, "PlayerOnlineStatusNotify" },
+        { 10107, "ServiceDisconnectNotify" },
+        { 10108, "PlayerDisconnectNotify" },
         { 10109, "DisconnectClientNotify" },
         { 10201, "OnlinePlayerNumReq" },
         { 10202, "OnlinePlayerNumRsp" },
@@ -815,73 +883,75 @@ static std::atomic<bool> g_loggedKey{ false };
 static constexpr uint16_t GET_PLAYER_TOKEN_REQ = 101;
 static constexpr uint16_t GET_PLAYER_TOKEN_RSP = 102;
 
-namespace PacketProcessor {
-
-    void _InternalShutdown() {
-        g_stop.store(true);
-        AcquireSRWLockExclusive(&g_qLock);
-        WakeAllConditionVariable(&g_qCv);
-        ReleaseSRWLockExclusive(&g_qLock);
-        if (g_writerThread) { CloseHandle(g_writerThread); g_writerThread = NULL; }
+static inline void XorWithEc2bInPlace(std::vector<uint8_t>& buf) {
+    const auto& xp = g_ec2b_xorpad;
+    if (xp.empty() || buf.empty()) return;
+    const size_t n = xp.size();
+    for (size_t i = 0; i < buf.size(); ++i) {
+        buf[i] ^= xp[i % n];
     }
+}
 
+namespace PacketProcessor {
     void Process(const std::vector<uint8_t>& rawBytes, PacketSource src) {
         EnsureInitOnce();
         int index = ++g_Index;
-        const uint8_t* frameData = rawBytes.data();
-        size_t frameLen = rawBytes.size();
-        std::vector<uint8_t> xorBuf;
+
+        std::vector<uint8_t> ec2bBuf = rawBytes;
+        if (index == 1 || index == 2)
+            XorWithEc2bInPlace(ec2bBuf);
+
+        const uint8_t* frameData = nullptr;
+        size_t frameLen = 0;
+        std::vector<uint8_t> postKeyBuf;
+
         if (g_DoXor.load(std::memory_order_acquire) && !g_Key.empty()) {
-            xorBuf = rawBytes;
-            XorInPlace(xorBuf, g_Key);
-            frameData = xorBuf.data();
-            frameLen = xorBuf.size();
+            postKeyBuf = ec2bBuf;
+            XorInPlace(postKeyBuf, g_Key);
+            frameData = postKeyBuf.data();
+            frameLen = postKeyBuf.size();
+        }
+        else {
+            frameData = ec2bBuf.data();
+            frameLen = ec2bBuf.size();
         }
 
         if (frameLen < 8) return;
 
         const uint8_t* p = frameData;
         uint16_t head = ReadBE16(p); p += 2;
-        if (head != 0x4567) return;
+        if (head != 0x4567) {
+            const std::string dump = to_hex(rawBytes.data(), rawBytes.size());
+            std::printf("Bad head (idx=%d, src=%d, len=%zu):\n%s\n",
+                index, (int)src, frameLen, dump.c_str());
+            return;
+        }
 
-        uint16_t cmdId = ReadBE16(p); p += 2;
-        uint16_t headerLen = ReadBE16(p); p += 2;
+        uint16_t cmdId = ReadBE16(p);      p += 2;
+        uint16_t headerLen = ReadBE16(p);  p += 2;
         if (frameData + frameLen < p + 4) return;
         uint32_t payloadLen = ReadBE32(p); p += 4;
 
         size_t remain = (frameData + frameLen) - p;
         if (remain < size_t(headerLen) + size_t(payloadLen) + 2) return;
 
-        const uint8_t* headerPtr = p;               p += headerLen; (void)headerPtr;
-        const uint8_t* payloadPtr = p;               p += payloadLen;
+        const uint8_t* headerPtr = p; p += headerLen; (void)headerPtr;
+        const uint8_t* payloadPtr = p; p += payloadLen;
         uint16_t trailer = ReadBE16(p);
         if (trailer != 0x89AB) return;
 
         switch (cmdId) {
-        case GET_PLAYER_TOKEN_REQ: {
-            std::string accUidStr;
-            if (ExtractAccountUid(payloadPtr, payloadLen, accUidStr)) {
-                uint64_t accUidNum = 0;
-                if (DecimalToU64(accUidStr, accUidNum)) {
-                    g_Key = NewKeyFromSeed(accUidNum);
-                    if (!g_loggedKey.exchange(true))
-                        printf("[PacketProcessor] Derived 4096-byte key from account_uid\n");
-                }
-            }
-        } break;
-
         case GET_PLAYER_TOKEN_RSP:
+            uint64_t keySeed;
+            if (ExtractSecretKeySeed(payloadPtr, payloadLen, keySeed)) {
+                g_Key = NewKeyFromSeed(keySeed);
+            }
             g_DoXor.store(true, std::memory_order_release);
             if (!g_loggedXorOn.exchange(true))
                 printf("[PacketProcessor] XOR enabled\n");
             break;
 
         default:
-            if (index >= 2) {
-                g_DoXor.store(true, std::memory_order_release);
-                if (!g_loggedXorOn.exchange(true))
-                    printf("[PacketProcessor] XOR enabled (fallback)\n");
-            }
             break;
         }
 

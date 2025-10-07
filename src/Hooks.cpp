@@ -64,7 +64,7 @@ namespace Hooks {
     void Uninitialize() {
         MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();
-        PacketProcessor::_InternalShutdown();
+        //PacketProcessor::_InternalShutdown();
     }
 
 }

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include "Hooks.h"
 #include <iostream>
+#include "ec2b_runtime.h"
 
 static HINSTANCE g_hinst = NULL;
 static HANDLE g_workerThread = NULL;
